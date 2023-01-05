@@ -1,0 +1,107 @@
+# PAM interface in python, launches compare.py
+
+# Import required modules
+import subprocess
+import os
+import glob
+import syslog
+import ConfigParser
+
+
+# Read config from disk
+config = ConfigParser.ConfigParser()
+config.read(os.path.dirname(os.path.abspath(__file__)) + "/config.ini")
+
+
+def doAuth(pamh):
+    # Abort if indra auth is disabled
+    if config.getboolean("core", "disabled"):
+        return pamh.PAM_AUTHINFO_UNAVAIL
+
+    # Abort if in a remote SSH environment
+    if config.getboolean("core", "ignore_ssh"):
+        if "SSH_CONNECTION" in os.environ or "SSH_CLIENT" in os.environ or "SSHD_OPTS" in os.environ:
+            return pamh.PAM_AUTHINFO_UNAVAIL
+
+    # Abort if lid is closed
+    if config.getboolean("core", "ignore_closed_lid"):
+        if any("closed" in open(f).read() for f in glob.glob("/proc/acpi/button/lid/*/state")):
+            return pamh.PAM_AUTHINFO_UNAVAIL
+
+    # Set up syslog
+    syslog.openlog("[Handsign]", 0, syslog.LOG_AUTH)
+
+    # Alert the user that we are doing hand sign authentication
+    if config.getboolean("core", "detection_notice"):
+        pamh.conversation(pamh.Message(
+            pamh.PAM_TEXT_INFO, "Attempting hand sign authentication"))
+
+    syslog.syslog(
+        syslog.LOG_INFO, "Attempting hand sign authentication for user " + pamh.get_user())
+
+    # Run compare as python3 subprocess to circumvent python version and import issues
+    status = subprocess.call(["/usr/bin/python3", os.path.dirname(
+        os.path.abspath(__file__)) + "/auth_yolo.py", pamh.get_user()], env=os.environ)
+
+    # Status 10 means we couldn't find
+    if status == 10:
+        # if not config.getboolean("core", "suppress_unknown"):
+        pamh.conversation(pamh.Message(
+            pamh.PAM_ERROR_MSG, "No hand sign is set as password"))
+
+        syslog.syslog(syslog.LOG_NOTICE,
+                      "Failure, no hand sign set as a password")
+        syslog.closelog()
+        return pamh.PAM_USER_UNKNOWN
+
+    # Status 11 means we exceded the maximum retry count
+    elif status == 11:
+        pamh.conversation(pamh.Message(pamh.PAM_ERROR_MSG,
+                          "The time to perform hand sign has exceed the time limit"))
+        syslog.syslog(syslog.LOG_INFO, "Failure, timeout reached")
+        syslog.closelog()
+        return pamh.PAM_AUTH_ERR
+
+    # Status 12 means we aborted, because of wrong sequence of hand sign perform
+    elif status == 12:
+        syslog.syslog(syslog.LOG_INFO, "Failure, general abort")
+        syslog.closelog()
+        return pamh.PAM_AUTH_ERR
+
+    # Status 0 is a successful exit
+    elif status == 0:
+        # Show the success message if it isn't suppressed
+        # if not config.getboolean("core", "no_confirmation"):
+        pamh.conversation(pamh.Message(pamh.PAM_TEXT_INFO,
+                                       "Identified as " + pamh.get_user()))
+
+        syslog.syslog(syslog.LOG_INFO, "Login approved")
+        syslog.closelog()
+        return pamh.PAM_SUCCESS
+
+    # Otherwise, we can't discribe what happend but it wasn't successful
+    pamh.conversation(pamh.Message(pamh.PAM_ERROR_MSG,
+                      "Unknown error: " + str(status)))
+    syslog.syslog(syslog.LOG_INFO, "Failure, unknown error " + str(status))
+    syslog.closelog()
+    return pamh.PAM_SYSTEM_ERR
+
+
+def pam_sm_authenticate(pamh, flags, args):
+    """Called by PAM when the user wants to authenticate, in sudo for example"""
+    return doAuth(pamh)
+
+
+def pam_sm_open_session(pamh, flags, args):
+    """Called when starting a session, such as su"""
+    return doAuth(pamh)
+
+
+def pam_sm_close_session(pamh, flags, argv):
+    """We don't need to clean anyting up at the end of a session, so returns true"""
+    return pamh.PAM_SUCCESS
+
+
+def pam_sm_setcred(pamh, flags, argv):
+    """We don't need set any credentials, so returns true"""
+    return pamh.PAM_SUCCESS
